@@ -1,7 +1,9 @@
-use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
-use crate::task::{block_current_and_run_next, current_process, current_task};
+use crate::sync::{set_deadlock_detect, Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
+use crate::task::{block_current_and_run_next, current_process, current_task, TaskControlBlock};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 /// sleep syscall
 pub fn sys_sleep(ms: usize) -> isize {
     trace!(
@@ -73,8 +75,7 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
     drop(process);
-    mutex.lock();
-    0
+    mutex.lock() as isize
 }
 /// mutex unlock syscall
 pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
@@ -166,8 +167,90 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     let process_inner = process.inner_exclusive_access();
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
-    sem.down();
-    0
+    drop(process);
+    // run the banker's deadlock detection before blocking
+    if detect_semaphore_deadlock(sem_id) {
+        return 0xdeadusize.wrapping_neg() as isize;
+    }
+    sem.down() as isize
+}
+
+/// Detect whether `semaphore_down(sem_id)` would cause a deadlock using the
+/// banker's algorithm over the current process's semaphores and threads.
+fn detect_semaphore_deadlock(sem_id: usize) -> bool {
+    let process = current_process();
+    // snapshot the semaphore list and thread list to avoid holding the lock
+    let (sems, tasks, current) = {
+        let inner = process.inner_exclusive_access();
+        let sems: Vec<Option<Arc<Semaphore>>> = inner.semaphore_list.clone();
+        let tasks: Vec<Arc<TaskControlBlock>> = inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.clone())
+            .collect();
+        (sems, tasks, current_task().unwrap())
+    };
+    let n_sem = sems.len();
+    let n_thread = tasks.len();
+
+    // gather available counts, holders and waiters for every semaphore
+    let mut available = vec![0isize; n_sem];
+    let mut holders: Vec<Vec<Arc<TaskControlBlock>>> = vec![Vec::new(); n_sem];
+    let mut waiters: Vec<Vec<Arc<TaskControlBlock>>> = vec![Vec::new(); n_sem];
+    for j in 0..n_sem {
+        if let Some(sem) = &sems[j] {
+            let inner = sem.inner.exclusive_access();
+            // a negative count means waiting threads and no free unit
+            available[j] = inner.count.max(0);
+            holders[j] = inner.holders.clone();
+            waiters[j] = inner.wait_queue.iter().cloned().collect();
+        }
+    }
+    // if the semaphore still has a free unit, no blocking (thus no deadlock)
+    if available[sem_id] > 0 {
+        return false;
+    }
+
+    // build the Allocation and Need matrices (n_thread x n_sem)
+    let mut allocation = vec![vec![0isize; n_sem]; n_thread];
+    let mut need = vec![vec![0isize; n_sem]; n_thread];
+    for j in 0..n_sem {
+        for holder in &holders[j] {
+            if let Some(i) = tasks.iter().position(|t| Arc::ptr_eq(t, holder)) {
+                allocation[i][j] += 1;
+            }
+        }
+        for waiter in &waiters[j] {
+            if let Some(i) = tasks.iter().position(|t| Arc::ptr_eq(t, waiter)) {
+                need[i][j] += 1;
+            }
+        }
+    }
+    // the current thread additionally requests one unit of `sem_id`
+    if let Some(i) = tasks.iter().position(|t| Arc::ptr_eq(t, &current)) {
+        need[i][sem_id] += 1;
+    }
+
+    // banker's safety check
+    let mut work = available.clone();
+    let mut finish = vec![false; n_thread];
+    loop {
+        let mut progressed = false;
+        for i in 0..n_thread {
+            if !finish[i] && (0..n_sem).all(|j| need[i][j] <= work[j]) {
+                for j in 0..n_sem {
+                    work[j] += allocation[i][j];
+                }
+                finish[i] = true;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    // unsafe state means a deadlock
+    !finish.iter().all(|&f| f)
 }
 /// condvar create syscall
 pub fn sys_condvar_create() -> isize {
@@ -244,8 +327,12 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
 }
 /// enable deadlock detection syscall
 ///
-/// YOUR JOB: Implement deadlock detection, but might not all in this syscall
-pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+/// `enabled` is 1 to enable deadlock detection, 0 to disable it.
+pub fn sys_enable_deadlock_detect(enabled: usize) -> isize {
+    trace!("kernel: sys_enable_deadlock_detect {}", enabled);
+    if enabled != 0 && enabled != 1 {
+        return -1;
+    }
+    set_deadlock_detect(enabled == 1);
+    0
 }
