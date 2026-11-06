@@ -265,6 +265,20 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    /// Check whether the given virtual page range overlaps with any existing area.
+    pub fn overlap_with(&self, vpn_range: VPNRange) -> bool {
+        self.areas.iter().any(|area| {
+            area.vpn_range.get_start() < vpn_range.get_end()
+                && area.vpn_range.get_end() > vpn_range.get_start()
+        })
+    }
+    /// Check whether an area starting at `start_va` reaches at least `end_vpn`.
+    pub fn area_covers(&self, start_va: VirtAddr, end_vpn: VirtPageNum) -> bool {
+        let start_vpn = start_va.floor();
+        self.areas
+            .iter()
+            .any(|area| area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() >= end_vpn)
+    }
 
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
