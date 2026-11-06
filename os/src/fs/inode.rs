@@ -53,13 +53,35 @@ impl OSInode {
         }
         v
     }
+    /// get the number of hard links
+    pub fn nlink(&self) -> u32 {
+        self.inner.exclusive_access().inode.nlink()
+    }
+    /// get the inode id
+    pub fn inode_id(&self) -> u64 {
+        self.inner.exclusive_access().inode.inode_id() as u64
+    }
+    /// whether this inode is a regular file
+    pub fn is_file(&self) -> bool {
+        self.inner.exclusive_access().inode.is_file()
+    }
 }
 
 lazy_static! {
-    pub static ref ROOT_INODE: Arc<Inode> = {
+    static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
     };
+}
+
+/// create a hard link `new_name` pointing to the same inode as `old_name`.
+pub fn link(old_name: &str, new_name: &str) -> isize {
+    ROOT_INODE.link(old_name, new_name)
+}
+
+/// remove the hard link `name`.
+pub fn unlink(name: &str) -> isize {
+    ROOT_INODE.unlink(name)
 }
 
 /// List all apps in the root directory
@@ -155,5 +177,14 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn is_file(&self) -> bool {
+        self.is_file()
+    }
+    fn inode_id(&self) -> u64 {
+        self.inode_id()
+    }
+    fn nlink(&self) -> u32 {
+        self.nlink()
     }
 }

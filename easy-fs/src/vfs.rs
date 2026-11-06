@@ -183,4 +183,119 @@ impl Inode {
         });
         block_cache_sync_all();
     }
+    /// Get the number of hard links of the current inode
+    pub fn nlink(&self) -> u32 {
+        self.read_disk_inode(|disk_inode| disk_inode.nlink())
+    }
+    /// Get the inode id of the current inode
+    pub fn inode_id(&self) -> u32 {
+        self.fs.lock().get_inode_id(self.block_id, self.block_offset)
+    }
+    /// Whether the current inode is a regular file
+    pub fn is_file(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_file())
+    }
+    /// Create a hard link `new_name` that points to the same inode as `old_name`.
+    pub fn link(&self, old_name: &str, new_name: &str) -> isize {
+        let mut fs = self.fs.lock();
+        // find the target inode id of `old_name`
+        let old_inode_id =
+            match self.read_disk_inode(|root_inode| self.find_inode_id(old_name, root_inode)) {
+                Some(id) => id,
+                None => return -1,
+            };
+        // `new_name` must not already exist
+        if self
+            .read_disk_inode(|root_inode| self.find_inode_id(new_name, root_inode))
+            .is_some()
+        {
+            return -1;
+        }
+        // append a new directory entry
+        self.modify_disk_inode(|root_inode| {
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            let dirent = DirEntry::new(new_name, old_inode_id);
+            root_inode.write_at(file_count * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+        });
+        // increase the nlink of the target inode
+        let (block_id, block_offset) = fs.get_disk_inode_pos(old_inode_id);
+        get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |disk_inode: &mut DiskInode| {
+                disk_inode.nlink_inc();
+            });
+        block_cache_sync_all();
+        0
+    }
+    /// Remove the hard link `name`; when the link count drops to zero, recycle
+    /// the inode and its data blocks.
+    pub fn unlink(&self, name: &str) -> isize {
+        let mut fs = self.fs.lock();
+        // find the directory entry index and inode id
+        let (inode_id, idx) = {
+            let mut found: Option<(u32, usize)> = None;
+            self.read_disk_inode(|root_inode| {
+                let file_count = (root_inode.size as usize) / DIRENT_SZ;
+                for i in 0..file_count {
+                    let mut dirent = DirEntry::empty();
+                    assert_eq!(
+                        root_inode.read_at(
+                            DIRENT_SZ * i,
+                            dirent.as_bytes_mut(),
+                            &self.block_device,
+                        ),
+                        DIRENT_SZ,
+                    );
+                    if dirent.name() == name {
+                        found = Some((dirent.inode_id(), i));
+                        break;
+                    }
+                }
+            });
+            match found {
+                Some(x) => x,
+                None => return -1,
+            }
+        };
+        // remove the dirent: move the last entry into `idx`, then shrink size
+        self.modify_disk_inode(|root_inode| {
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            if idx != file_count - 1 {
+                let mut last = DirEntry::empty();
+                assert_eq!(
+                    root_inode.read_at(
+                        DIRENT_SZ * (file_count - 1),
+                        last.as_bytes_mut(),
+                        &self.block_device,
+                    ),
+                    DIRENT_SZ,
+                );
+                root_inode.write_at(DIRENT_SZ * idx, last.as_bytes(), &self.block_device);
+            }
+            root_inode.size = ((file_count - 1) * DIRENT_SZ) as u32;
+        });
+        // decrease nlink; recycle the inode and data blocks when it reaches zero
+        let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+        let nlink = get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |disk_inode: &mut DiskInode| {
+                disk_inode.nlink_dec();
+                disk_inode.nlink()
+            });
+        if nlink == 0 {
+            let data_blocks = get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+                .lock()
+                .modify(block_offset, |disk_inode: &mut DiskInode| {
+                    disk_inode.clear_size(&self.block_device)
+                });
+            for data_block in data_blocks {
+                fs.dealloc_data(data_block);
+            }
+            fs.dealloc_inode(inode_id);
+        }
+        block_cache_sync_all();
+        0
+    }
 }
