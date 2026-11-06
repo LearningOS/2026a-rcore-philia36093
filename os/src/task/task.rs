@@ -1,8 +1,8 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, PAGE_SIZE, TRAP_CONTEXT_BASE};
 use crate::mm::{
-    kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
+    kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, VPNRange, KERNEL_SPACE,
 };
 use crate::trap::{trap_handler, TrapContext};
 
@@ -28,6 +28,9 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Count how many times each syscall has been invoked by this task.
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
 }
 
 impl TaskControlBlock {
@@ -63,6 +66,7 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            syscall_times: [0; MAX_SYSCALL_NUM],
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
@@ -94,6 +98,48 @@ impl TaskControlBlock {
             Some(old_break)
         } else {
             None
+        }
+    }
+    /// map an anonymous memory region [start, start + len) with the given
+    /// `prot` (bit 0 = readable, bit 1 = writable, bit 2 = executable).
+    pub fn mmap(&mut self, start: usize, len: usize, prot: usize) -> isize {
+        // start must be page-aligned
+        if start % PAGE_SIZE != 0 {
+            return -1;
+        }
+        // prot: only the low 3 bits are valid and at least one must be set
+        if prot & !0x7 != 0 || prot & 0x7 == 0 {
+            return -1;
+        }
+        let map_perm =
+            MapPermission::from_bits(((prot & 0x7) << 1) as u8).unwrap() | MapPermission::U;
+        let mmap_start = VirtAddr::from(start);
+        let mmap_end = VirtAddr::from(start + len);
+        // the region must not overlap with any existing area
+        if self
+            .memory_set
+            .overlap_with(VPNRange::new(mmap_start.floor(), mmap_end.ceil()))
+        {
+            return -1;
+        }
+        self.memory_set.insert_framed_area(mmap_start, mmap_end, map_perm);
+        0
+    }
+    /// unmap the anonymous memory region starting at `start`.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        if start % PAGE_SIZE != 0 || len == 0 {
+            return -1;
+        }
+        let start_va = VirtAddr::from(start);
+        let end_vpn = VirtAddr::from(start + len).ceil();
+        // the area must start exactly at `start` and cover [start, start + len)
+        if !self.memory_set.area_covers(start_va, end_vpn) {
+            return -1;
+        }
+        if self.memory_set.remove_area_with_start(start_va) {
+            0
+        } else {
+            -1
         }
     }
 }

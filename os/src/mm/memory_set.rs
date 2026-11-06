@@ -233,6 +233,36 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    /// Check whether the given virtual page range overlaps with any existing area.
+    pub fn overlap_with(&self, vpn_range: VPNRange) -> bool {
+        self.areas.iter().any(|area| {
+            area.vpn_range.get_start() < vpn_range.get_end()
+                && area.vpn_range.get_end() > vpn_range.get_start()
+        })
+    }
+    /// Remove the area whose start address is `start_va` (if any), unmapping all
+    /// of its pages and recycling the frames.
+    pub fn remove_area_with_start(&mut self, start_va: VirtAddr) -> bool {
+        if let Some((idx, area)) = self
+            .areas
+            .iter_mut()
+            .enumerate()
+            .find(|(_, area)| area.vpn_range.get_start() == start_va.floor())
+        {
+            area.unmap(&mut self.page_table);
+            self.areas.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+    /// Check whether an area starting at `start_va` reaches at least `end_vpn`.
+    pub fn area_covers(&self, start_va: VirtAddr, end_vpn: VirtPageNum) -> bool {
+        let start_vpn = start_va.floor();
+        self.areas
+            .iter()
+            .any(|area| area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() >= end_vpn)
+    }
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
